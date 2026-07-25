@@ -137,3 +137,100 @@ Extend the database to support querying past values.
 - If the field did not exist at that time, return Optional.empty()
 
 TTL rules must apply at atTimestamp.
+
+---
+
+## Learning Notes
+
+Quick revision guide — key decisions, bugs caught, and patterns learned while implementing this.
+
+### Data Structure Evolution
+
+| Level | Store Type | Why |
+|---|---|---|
+| 1–2 | `Map<String, Map<String, Integer>>` | Simple CRUD, no expiry needed |
+| 3 | `Map<String, Map<String, Entry>>` | Value alone isn't enough — need `value + expiresAt` together |
+| 4 | `Map<String, Map<String, List<Entry>>>` | Need full history per field for historical queries |
+
+Each evolution was driven by a new requirement, not speculation. Don't over-design upfront.
+
+### Entry Class
+
+```java
+class Entry {
+    int value;
+    int expiresAt;  // -1 means no expiry (sentinel)
+    int timestamp;  // when this version was written (setAt)
+}
+```
+
+**Why not `Pair<Integer, Integer>`?** Named fields (`expiresAt`, `timestamp`) are unambiguous. `pair.getFirst()` tells you nothing. Use `record` in Java 16+ for cleaner syntax — auto-generates constructor, equals, hashCode.
+
+**Why not use Map as a key?** Maps are mutable — their `hashCode()` changes when mutated. Mutable objects as Map keys cause silent data loss. Keys must be immutable.
+
+**Why `Integer` not `int` in generics?** Java generics require reference types. Primitives are boxed automatically (autoboxing). `Map<String, int>` is a compile error.
+
+### TTL Design
+
+- Sentinel `-1` means "never expires" — safe because timestamps are non-negative
+- `expiresAt = timestamp + ttl` stored at write time, not recalculated on read
+- Expiry check: `entry.expiresAt != -1 && queryTime >= entry.expiresAt`
+- Boundary is **end-exclusive**: `>=` not `>` — a value set at `t=5` with `ttl=3` expires at `t=8`, so `queryTime=8` returns empty
+- Extract `isExpired(Entry, int timestamp)` helper — used in `get`, `compareAndDelete`, `scanByPrefix`, `compareAndSetWithTTL`. One place to fix boundary bugs.
+
+### HashMap vs TreeMap for scan
+
+- `HashMap`: `get`/`set` O(1), `scan` O(n log n) — sort on every read
+- `TreeMap`: `get`/`set` O(log n), `scan` O(n) — sorted automatically
+- **Chose HashMap** because `get`/`set` are called far more than `scan` in Redis-like systems. Pay cost at read, not write. This is the **read vs write optimization tradeoff** — same as database indexing.
+
+### Delegation Pattern
+
+```java
+set(...)           → setWithTTL(..., -1)
+compareAndSet(...) → compareAndSetWithTTL(..., -1)
+scan(...)          → scanByPrefix(..., "")
+```
+
+Simpler methods delegate to more general ones. Bug fixes apply everywhere automatically. Every String starts with `""`, so `scan` is `scanByPrefix` with empty prefix.
+
+### Append-Only History (Level 4)
+
+Timestamps are guaranteed strictly increasing, so appending to the list keeps it **naturally sorted by `setAt`** — no sorting needed. This is the same principle as LSM trees (Cassandra, RocksDB): append-only writes, scan backwards to find latest version.
+
+### getWhen — Binary Search
+
+Find the **rightmost entry where `setAt <= atTimestamp`**:
+
+```java
+while(l <= r) {
+    int mid = (l + r) / 2;
+    if(entry.timestamp <= atTimestamp) {
+        closestEntry = entry;  // candidate, keep searching right
+        l = mid + 1;
+    } else {
+        r = mid - 1;
+    }
+}
+```
+
+Key points:
+- Use `l <= r` not `l < r` — `l < r` stops one iteration early and misses the convergence point
+- TTL check uses `atTimestamp` (past time), not `timestamp` (current time) — spec says "TTL rules applied at that past time"
+- `atTimestamp == 0` falls back to normal `get`
+
+### Common Java Bugs to Watch
+
+| Bug | Fix |
+|---|---|
+| `int value = map.get(field)` before null check | Use `Integer value = map.get(field)` first, then null check |
+| `Object.equals(a, b)` | `Objects.equals(a, b)` — `java.util.Objects`, static utility |
+| `Collections.sort()` assigned to variable | It returns `void`, sorts in-place. Call then return separately |
+| `return false` inside a loop in a `List`-returning method | Use `continue` to skip, not `return` |
+| Using `==` to compare `Integer` objects | Use `.equals()` — `==` compares references, unreliable outside JVM cache range (-128 to 127) |
+| Mutable object as Map key | HashMap uses `hashCode()` — mutable keys cause silent data loss |
+| `store.put(key, record)` after mutating `record` | Unnecessary — `record` is already a live reference into the map |
+
+### CAS — compareAndSet
+
+Fundamental concurrency primitive — compare then swap without locks. In Redis, `GETSET` and Lua scripts serve the same purpose. Always check: does key exist? does field exist? is value equal? Only then write. Expired entries must be treated as non-existent.
